@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF Signature Position Finder</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.10.377/pdf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+</head>
+<body>
+    <h1>Recherche automatique de zone de signature</h1>
+    <p>Ce script réalisera les étapes suivantes:</p>
+    <small>Le script réalise ces étapes dans l'ordre; il essaie d'abord la première étape, puis si elle échoue, passe à la suivante</small>
+    <ol>
+        <li>Recherche des mots clés "signature", "bon pour accord", ou "lu et approuvé"</li>
+        <li>Recherche d'espace vide où l'on pourrait ajouter une signature</li>
+        <li>Ajout d'une page prédéfinie (avec un emplacement pour signer)</li>
+    </ol>
+
+    <input type="file" id="pdf-input" />
+    <hr />
+    <h2>Position de la signature</h2>
+    <pre style="outline: 1px solid black; min-height: 200px; width: 250px;" id="output"></pre>
+
+    <script>
+        let loadedPdfBytes = null;
+        document.getElementById('pdf-input').addEventListener('change', function(event) {
+            const file = event.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    loadedPdfBytes = new Uint8Array(e.target.result);
+                    getPdfPageHeights(loadedPdfBytes);
+                    findSignaturePosition(loadedPdfBytes);
+                };
+                reader.readAsArrayBuffer(file);
+            }
+        });
+
+        async function findSignaturePosition(pdfData) {
+            const loadingTask = pdfjsLib.getDocument({ data: pdfData });
+            const pdf = await loadingTask.promise;
+            let signaturePosition = null;
+
+            for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+                const page = await pdf.getPage(pageNum);
+                const textContent = await page.getTextContent();
+                const viewport = page.getViewport({ scale: 1 });
+
+                textContent.items.forEach((item) => {
+                    const text = item.str;
+                    if (text.toLocaleLowerCase().includes("signature") ||
+                        text.toLocaleLowerCase().includes("bon pour accord") ||
+                        text.toLocaleLowerCase().includes("lu et approuvé")) {
+                            signaturePosition = {
+                                page: pageNum,
+                                x_position: item.transform[4],  // Position X du texte
+                                y_position: viewport.height - item.transform[5]  // Position Y du texte (l'axe Y est inversé)
+                            };
+                    }
+                });
+
+                if (signaturePosition) {
+                    break;
+                }
+            }
+
+            if (!signaturePosition) {
+                console.warn("La signature n'a pas été trouvée dans le document. Recherche d'un espace vide...");
+                findSignatureArea(pdfData);
+            } else {
+                document.getElementById('output').textContent = JSON.stringify(signaturePosition, null, 2);
+            }
+        }
+
+        async function findSignatureArea(pdfData) {
+            const loadingTask = pdfjsLib.getDocument({ data: pdfData });
+            const pdf = await loadingTask.promise;
+            let emptySpacePosition = null;
+
+            for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+                const page = await pdf.getPage(pageNum);
+                const textContent = await page.getTextContent();
+                const viewport = page.getViewport({ scale: 1 });
+
+                let lastTextYPosition = 0;
+
+                // Parcourir les éléments de texte de la page pour obtenir la position Y du dernier élément
+                textContent.items.forEach((item) => {
+                    const textYPosition = viewport.height - item.transform[5];
+                    lastTextYPosition = Math.max(lastTextYPosition, textYPosition);
+                });
+
+                // Vérifier s'il y a un espace important entre le dernier texte et le bas de la page
+                const threshold = 100; // Si l'espace est supérieur à 100 unités, on considère un espace vide
+                const bottomOfPage = viewport.height;
+                const emptySpace = bottomOfPage - lastTextYPosition;
+
+                if (emptySpace > threshold) {
+                    emptySpacePosition = {
+                        page: pageNum,
+                        x_position: 50,  // Par défaut, on choisit une position X à gauche
+                        y_position: lastTextYPosition + 50  // La signature pourrait être 50 unités sous le dernier texte
+                    };
+                    break;
+                }
+            }
+
+            if (!emptySpacePosition) {
+                document.getElementById('output').textContent = "Aucun espace vide significatif trouvé.";
+                const newPdfBytes = await mergePdfs(loadedPdfBytes, await fetchSignaturePage());
+
+                findSignaturePosition(newPdfBytes)
+                // TODO replace by storage solution
+                downloadPdf(newPdfBytes, 'modified_pdf_with_signature_page.pdf');
+            } else {
+                document.getElementById('output').textContent = JSON.stringify(emptySpacePosition, null, 2);
+            }
+        }
+
+
+        function downloadPdf(pdfBytes, fileName) {
+            const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+            const link = document.createElement('a');
+            link.href = window.URL.createObjectURL(blob);
+            link.download = fileName;
+            link.click();
+        }
+
+        async function fetchSignaturePage() {
+            const pdfFetched = await fetch('./doc_sign.pdf');
+            if (!pdfFetched.ok) {
+                throw new Error(`Erreur lors du chargement du fichier PDF: ${pdfFetched.statusText}`);
+            }
+            return new Uint8Array(await pdfFetched.arrayBuffer());
+        }
+
+        // Fusionner les deux PDFs
+        async function mergePdfs(firstPdfBytes, secondPdfBytes) {
+
+            const firstPdfDoc = await PDFLib.PDFDocument.load(firstPdfBytes);
+            const secondPdfDoc = await PDFLib.PDFDocument.load(secondPdfBytes);
+
+            // Copier toutes les pages du deuxième PDF dans le premier PDF
+            const secondPdfPages = await firstPdfDoc.copyPages(secondPdfDoc, secondPdfDoc.getPageIndices());
+
+            // Ajouter les pages copiées au premier PDF
+            secondPdfPages.forEach((page) => {
+                firstPdfDoc.addPage(page);
+            });
+            return await firstPdfDoc.save();
+        }
+
+        // Fonction pour déterminer la hauteur de chaque page dans le PDF
+        async function getPdfPageHeights(pdfBytes) {
+            const pdfDoc = await PDFLib.PDFDocument.load(pdfBytes);  // Charger le PDF
+            console.log("height: "  ,pdfDoc.getPage(1).getHeight())
+        }
+    </script>
+</body>
+</html>
